@@ -356,9 +356,13 @@ with tabs[2]:
             .sort_index()
         )
         candidates = []
+        attempted_pairs = 0
+        skipped_short = 0
         for a, b in itertools.combinations([c for c in products if c in pivot.columns], 2):
+            attempted_pairs += 1
             pair = pivot[[a, b]].dropna()
             if len(pair) < 200:
+                skipped_short += 1
                 continue
             y = np.log(pair[a].values + 1e-12)
             x = np.log(pair[b].values + 1e-12)
@@ -369,38 +373,63 @@ with tabs[2]:
                 pass
         candidates.sort(key=lambda z: z[0])
         best = candidates[:3]
-        st.write("Top pairs:", best)
-        rows = []
-        for pval, a, b in best:
-            pair = pivot[[a, b]].dropna()
-            pair = pair.apply(pd.to_numeric, errors="coerce").dropna()
-            t = pair.index.values
-            y = np.log(pair[a].values + 1e-12)
-            x = np.log(pair[b].values + 1e-12)
-            intercept, beta, resid = kalman_beta(y, x)
-            rs = pd.Series(resid)
-            win = min(300, max(60, len(rs) // 3))
-            z = (rs - rs.rolling(win, min_periods=max(20, win // 5)).mean()) / (
-                rs.rolling(win, min_periods=max(20, win // 5)).std(ddof=0) + 1e-12
+        st.caption(
+            f"Attempted pairs: {attempted_pairs} | "
+            f"with enough overlap (>=200): {attempted_pairs - skipped_short} | "
+            f"cointegration candidates: {len(candidates)}"
+        )
+
+        if not best:
+            st.info(
+                "No cointegrated pairs found for the current uploaded data/rounds under the current overlap threshold."
             )
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12)
-            fig.add_trace(go.Scatter(x=t, y=z, mode="lines", line=dict(color=NEON["cyan"]), name="z"), row=1, col=1)
-            for s in (1, 2, 3):
-                fig.add_hline(y=s, line_dash="dash", line_color=NEON["red"], row=1, col=1)
-                fig.add_hline(y=-s, line_dash="dash", line_color=NEON["red"], row=1, col=1)
-            fig.add_trace(go.Histogram(x=z.dropna(), nbinsx=60, marker_color=NEON["magenta"]), row=2, col=1)
-            set_plotly_layout(fig, f"{a} vs {b} (p={pval:.3g})")
-            st.plotly_chart(fig, use_container_width=True)
-            rows.append(
-                {
-                    "pair": [a, b],
-                    "cointegration_pvalue": pval,
-                    "beta_latest": float(beta[-1]),
-                    "z_latest": float(z.dropna().iloc[-1]) if not z.dropna().empty else float("nan"),
-                    "hurst_resid": hurst_rs(resid),
-                }
-            )
-        strategy["stat_arb"] = {"pairs": rows}
+            # Fallback: show top correlated pairs so user still gets guidance.
+            corr = pivot.corr().replace([np.inf, -np.inf], np.nan)
+            rows_fallback = []
+            cols = [c for c in products if c in corr.columns]
+            for a, b in itertools.combinations(cols, 2):
+                v = corr.loc[a, b]
+                if pd.notna(v):
+                    rows_fallback.append((a, b, float(v)))
+            rows_fallback.sort(key=lambda t: abs(t[2]), reverse=True)
+            top_corr = pd.DataFrame(rows_fallback[:10], columns=["a", "b", "corr"])
+            if not top_corr.empty:
+                st.write("Fallback: top correlated pairs")
+                st.dataframe(top_corr, use_container_width=True)
+            strategy["stat_arb"] = {"pairs": []}
+        else:
+            st.write("Top pairs:", best)
+            rows = []
+            for pval, a, b in best:
+                pair = pivot[[a, b]].dropna()
+                pair = pair.apply(pd.to_numeric, errors="coerce").dropna()
+                t = pair.index.values
+                y = np.log(pair[a].values + 1e-12)
+                x = np.log(pair[b].values + 1e-12)
+                intercept, beta, resid = kalman_beta(y, x)
+                rs = pd.Series(resid)
+                win = min(300, max(60, len(rs) // 3))
+                z = (rs - rs.rolling(win, min_periods=max(20, win // 5)).mean()) / (
+                    rs.rolling(win, min_periods=max(20, win // 5)).std(ddof=0) + 1e-12
+                )
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12)
+                fig.add_trace(go.Scatter(x=t, y=z, mode="lines", line=dict(color=NEON["cyan"]), name="z"), row=1, col=1)
+                for s in (1, 2, 3):
+                    fig.add_hline(y=s, line_dash="dash", line_color=NEON["red"], row=1, col=1)
+                    fig.add_hline(y=-s, line_dash="dash", line_color=NEON["red"], row=1, col=1)
+                fig.add_trace(go.Histogram(x=z.dropna(), nbinsx=60, marker_color=NEON["magenta"]), row=2, col=1)
+                set_plotly_layout(fig, f"{a} vs {b} (p={pval:.3g})")
+                st.plotly_chart(fig, use_container_width=True)
+                rows.append(
+                    {
+                        "pair": [a, b],
+                        "cointegration_pvalue": pval,
+                        "beta_latest": float(beta[-1]),
+                        "z_latest": float(z.dropna().iloc[-1]) if not z.dropna().empty else float("nan"),
+                        "hurst_resid": hurst_rs(resid),
+                    }
+                )
+            strategy["stat_arb"] = {"pairs": rows}
 
 # Module 4
 with tabs[3]:
