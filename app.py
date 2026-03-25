@@ -1,4 +1,5 @@
 import itertools
+import io
 import json
 import math
 import re
@@ -89,10 +90,10 @@ def parse_round_day(fname: str) -> Optional[Tuple[str, int, int]]:
     return k, int(r), int(d)
 
 
-def discover_rounds(data_root: str) -> List[int]:
+def discover_rounds_from_filenames(filenames: List[str]) -> List[int]:
     rounds = set()
-    for p in Path(data_root).rglob("prices_*.csv"):
-        parsed = parse_round_day(p.name)
+    for fname in filenames:
+        parsed = parse_round_day(fname)
         if parsed:
             _, r, _ = parsed
             rounds.add(r)
@@ -100,21 +101,17 @@ def discover_rounds(data_root: str) -> List[int]:
 
 
 @st.cache_data(show_spinner=False)
-def load_infinite_data(data_root: str, selected_rounds: Optional[Tuple[int, ...]] = None):
-    data_dir = Path(data_root)
-    if not data_dir.exists():
-        raise FileNotFoundError(f"Data folder not found: {data_root}")
-
+def load_infinite_data(uploaded_payload: Tuple[Tuple[str, bytes], ...], selected_rounds: Optional[Tuple[int, ...]] = None):
     rounds_set = None if selected_rounds is None else set(selected_rounds)
     price_files, trade_files, obs_files = [], [], []
-    for p in data_dir.rglob("*.csv"):
-        parsed = parse_round_day(p.name)
+    for fname, content in uploaded_payload:
+        parsed = parse_round_day(fname)
         if not parsed:
             continue
         kind, r, d = parsed
         if rounds_set is not None and r not in rounds_set:
             continue
-        item = (r, d, p)
+        item = (r, d, fname, content)
         if kind == "prices":
             price_files.append(item)
         elif kind == "trades":
@@ -128,20 +125,20 @@ def load_infinite_data(data_root: str, selected_rounds: Optional[Tuple[int, ...]
     price_files.sort(key=lambda x: (x[0], x[1]))
     offsets = {}
     prev_max = 0
-    for r, d, path in price_files:
-        ts = pd.read_csv(path, sep=";", usecols=["timestamp"])["timestamp"]
+    for r, d, _, content in price_files:
+        ts = pd.read_csv(io.BytesIO(content), sep=";", usecols=["timestamp"])["timestamp"]
         offset = prev_max + 100
         offsets[(r, d)] = offset
         prev_max = int(ts.max()) + offset
 
-    def read_one(path: Path, kind: str) -> pd.DataFrame:
+    def read_one(content: bytes, kind: str) -> pd.DataFrame:
         sep = ";" if kind in ("prices", "trades") else ","
-        return pd.read_csv(path, sep=sep)
+        return pd.read_csv(io.BytesIO(content), sep=sep)
 
     def load_group(files, kind, normalize=None):
         out = []
-        for r, d, path in sorted(files, key=lambda x: (x[0], x[1])):
-            df = read_one(path, kind)
+        for r, d, _, content in sorted(files, key=lambda x: (x[0], x[1])):
+            df = read_one(content, kind)
             if "timestamp" not in df.columns:
                 continue
             df["t"] = pd.to_numeric(df["timestamp"], errors="coerce") + offsets[(r, d)]
@@ -202,18 +199,27 @@ st.set_page_config(page_title="IMC Prosperity Research Dashboard", layout="wide"
 st.title("IMC Prosperity - Streamlit Research App")
 st.caption("Notebook-equivalent dashboard with round filter and interactive Plotly modules.")
 
-data_root = st.sidebar.text_input("Data folder", value="./data")
-all_rounds = discover_rounds(data_root) if Path(data_root).exists() else []
-rounds_sel = st.sidebar.multiselect("Rounds to load", options=all_rounds, default=all_rounds)
+uploaded_files = st.sidebar.file_uploader(
+    "Upload IMC CSV files (prices/trades/observations)",
+    type=["csv"],
+    accept_multiple_files=True,
+)
+if not uploaded_files:
+    st.info("Upload CSV files in the sidebar to start.")
+    st.stop()
+
+uploaded_payload = tuple((f.name, f.getvalue()) for f in uploaded_files)
+all_rounds = discover_rounds_from_filenames([name for name, _ in uploaded_payload])
+rounds_sel = st.sidebar.multiselect("Rounds to load", options=all_rounds, default=all_rounds or None)
 horizon = st.sidebar.slider("Future horizon (steps)", 1, 50, 10)
 max_points = st.sidebar.slider("Max points in heavy charts", 5000, 60000, 25000, step=1000)
 
 if not all_rounds:
-    st.warning("No rounds discovered in ./data yet.")
+    st.warning("No valid round files detected in uploaded CSVs.")
     st.stop()
 
 selected_tuple = tuple(rounds_sel) if rounds_sel else None
-prices, trades, obs = load_infinite_data(data_root, selected_tuple)
+prices, trades, obs = load_infinite_data(uploaded_payload, selected_tuple)
 
 if prices.empty:
     st.error("No price data loaded.")
