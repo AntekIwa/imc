@@ -176,6 +176,10 @@ def load_infinite_data(uploaded_payload: Tuple[Tuple[str, bytes], ...], selected
 
 
 def kalman_beta(y: np.ndarray, x: np.ndarray):
+    # Force strictly numeric vectors to avoid dtype/object issues.
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+
     state = np.array([0.0, 0.0], dtype=float)  # intercept, beta
     P = np.eye(2) * 1e3
     Q = np.diag([1e-6, 1e-5])
@@ -184,9 +188,11 @@ def kalman_beta(y: np.ndarray, x: np.ndarray):
     intercept, beta, resid = np.zeros(n), np.zeros(n), np.zeros(n)
     for i in range(n):
         P = P + Q
-        H = np.array([[1.0, x[i]]], dtype=float)
-        yhat = float(H @ state)
+        # Equivalent observation model: y_t = a_t + b_t * x_t
+        # Using scalar arithmetic avoids ndarray->float conversion edge-cases.
+        yhat = float(state[0] + state[1] * x[i])
         e = float(y[i] - yhat)
+        H = np.array([[1.0, x[i]]], dtype=float)
         S = float(H @ P @ H.T + r_obs)
         K = (P @ H.T) / max(S, 1e-8)
         state = state + K.flatten() * e
@@ -270,29 +276,47 @@ with tabs[0]:
             step = max(1, len(sub) // max(1, max_points // max(1, len(products))))
             keep.append(sub.iloc[::step])
         df = pd.concat(keep, ignore_index=True)
+    view_mode = st.radio("Topography view", options=["3D", "2D"], horizontal=True, key="topography_view")
+
     fig = go.Figure()
     palette = [NEON["green"], NEON["red"], NEON["cyan"], NEON["magenta"], NEON["yellow"], NEON["purple"]]
-    for i, p in enumerate(products):
-        sub = df[df["product"] == p]
-        fig.add_trace(
-            go.Scatter3d(
-                x=sub["t"],
-                y=sub["pid"],
-                z=sub["norm_price"],
-                mode="lines",
-                line=dict(color=palette[i % len(palette)], width=2),
-                name=p,
+    if view_mode == "3D":
+        for i, p in enumerate(products):
+            sub = df[df["product"] == p]
+            fig.add_trace(
+                go.Scatter3d(
+                    x=sub["t"],
+                    y=sub["pid"],
+                    z=sub["norm_price"],
+                    mode="lines",
+                    line=dict(color=palette[i % len(palette)], width=2),
+                    name=p,
+                )
+            )
+        fig.update_layout(
+            scene=dict(
+                yaxis=dict(tickmode="array", tickvals=list(p2i.values()), ticktext=list(p2i.keys())),
+                xaxis_title="t",
+                yaxis_title="product",
+                zaxis_title="normalized price",
             )
         )
-    fig.update_layout(
-        scene=dict(
-            yaxis=dict(tickmode="array", tickvals=list(p2i.values()), ticktext=list(p2i.keys())),
-            xaxis_title="t",
-            yaxis_title="product",
-            zaxis_title="normalized price",
-        )
-    )
-    set_plotly_layout(fig, "Global Market 3D Topography")
+        set_plotly_layout(fig, "Global Market Topography (3D)")
+    else:
+        for i, p in enumerate(products):
+            sub = df[df["product"] == p]
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["t"],
+                    y=sub["norm_price"],
+                    mode="lines",
+                    line=dict(color=palette[i % len(palette)], width=1.8),
+                    name=p,
+                )
+            )
+        fig.update_xaxes(title="t")
+        fig.update_yaxes(title="normalized price (z-score)")
+        set_plotly_layout(fig, "Global Market Topography (2D)")
     st.plotly_chart(fig, use_container_width=True)
 
 # Module 2
@@ -349,6 +373,7 @@ with tabs[2]:
         rows = []
         for pval, a, b in best:
             pair = pivot[[a, b]].dropna()
+            pair = pair.apply(pd.to_numeric, errors="coerce").dropna()
             t = pair.index.values
             y = np.log(pair[a].values + 1e-12)
             x = np.log(pair[b].values + 1e-12)
