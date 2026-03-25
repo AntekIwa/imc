@@ -265,210 +265,254 @@ strategy["meta"] = {
 
 # Module 1
 with tabs[0]:
-    df = prices[["product", "t", "mid_price"]].dropna().copy()
-    df["norm_price"] = df.groupby("product")["mid_price"].transform(zscore)
-    p2i = {p: i for i, p in enumerate(products)}
-    df["pid"] = df["product"].map(p2i)
-    if len(df) > max_points:
-        keep = []
-        for p in products:
-            sub = df[df["product"] == p]
-            step = max(1, len(sub) // max(1, max_points // max(1, len(products))))
-            keep.append(sub.iloc[::step])
-        df = pd.concat(keep, ignore_index=True)
-    view_mode = st.radio("Topography view", options=["3D", "2D"], horizontal=True, key="topography_view")
+    try:
+        req1 = {"product", "t", "mid_price"}
+        miss1 = [c for c in req1 if c not in prices.columns]
+        if miss1:
+            st.warning(f"Module 1 unavailable for selected rounds/files. Missing columns: {miss1}")
+        else:
+            df = prices[["product", "t", "mid_price"]].dropna().copy()
+            if df.empty or df["product"].nunique() == 0:
+                st.info("Module 1 unavailable: no valid price points after cleaning.")
+            else:
+                df["norm_price"] = df.groupby("product")["mid_price"].transform(zscore)
+                p2i = {p: i for i, p in enumerate(products)}
+                df["pid"] = df["product"].map(p2i)
+                if len(df) > max_points:
+                    keep = []
+                    for p in products:
+                        sub = df[df["product"] == p]
+                        step = max(1, len(sub) // max(1, max_points // max(1, len(products))))
+                        keep.append(sub.iloc[::step])
+                    df = pd.concat(keep, ignore_index=True)
+                view_mode = st.radio("Topography view", options=["3D", "2D"], horizontal=True, key="topography_view")
 
-    fig = go.Figure()
-    palette = [NEON["green"], NEON["red"], NEON["cyan"], NEON["magenta"], NEON["yellow"], NEON["purple"]]
-    if view_mode == "3D":
-        for i, p in enumerate(products):
-            sub = df[df["product"] == p]
-            fig.add_trace(
-                go.Scatter3d(
-                    x=sub["t"],
-                    y=sub["pid"],
-                    z=sub["norm_price"],
-                    mode="lines",
-                    line=dict(color=palette[i % len(palette)], width=2),
-                    name=p,
-                )
-            )
-        fig.update_layout(
-            scene=dict(
-                yaxis=dict(tickmode="array", tickvals=list(p2i.values()), ticktext=list(p2i.keys())),
-                xaxis_title="t",
-                yaxis_title="product",
-                zaxis_title="normalized price",
-            )
-        )
-        set_plotly_layout(fig, "Global Market Topography (3D)")
-    else:
-        for i, p in enumerate(products):
-            sub = df[df["product"] == p]
-            fig.add_trace(
-                go.Scatter(
-                    x=sub["t"],
-                    y=sub["norm_price"],
-                    mode="lines",
-                    line=dict(color=palette[i % len(palette)], width=1.8),
-                    name=p,
-                )
-            )
-        fig.update_xaxes(title="t")
-        fig.update_yaxes(title="normalized price (z-score)")
-        set_plotly_layout(fig, "Global Market Topography (2D)")
-    st.plotly_chart(fig, use_container_width=True)
+                fig = go.Figure()
+                palette = [NEON["green"], NEON["red"], NEON["cyan"], NEON["magenta"], NEON["yellow"], NEON["purple"]]
+                if view_mode == "3D":
+                    for i, p in enumerate(products):
+                        sub = df[df["product"] == p]
+                        fig.add_trace(
+                            go.Scatter3d(
+                                x=sub["t"],
+                                y=sub["pid"],
+                                z=sub["norm_price"],
+                                mode="lines",
+                                line=dict(color=palette[i % len(palette)], width=2),
+                                name=p,
+                            )
+                        )
+                    fig.update_layout(
+                        scene=dict(
+                            yaxis=dict(tickmode="array", tickvals=list(p2i.values()), ticktext=list(p2i.keys())),
+                            xaxis_title="t",
+                            yaxis_title="product",
+                            zaxis_title="normalized price",
+                        )
+                    )
+                    set_plotly_layout(fig, "Global Market Topography (3D)")
+                else:
+                    for i, p in enumerate(products):
+                        sub = df[df["product"] == p]
+                        fig.add_trace(
+                            go.Scatter(
+                                x=sub["t"],
+                                y=sub["norm_price"],
+                                mode="lines",
+                                line=dict(color=palette[i % len(palette)], width=1.8),
+                                name=p,
+                            )
+                        )
+                    fig.update_xaxes(title="t")
+                    fig.update_yaxes(title="normalized price (z-score)")
+                    set_plotly_layout(fig, "Global Market Topography (2D)")
+                st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.error(f"Module 1 failed for current rounds/files: {e}")
 
 # Module 2
 with tabs[1]:
-    if trades.empty or "product" not in trades.columns:
-        st.info("Trades unavailable for counterparty edge.")
-    else:
-        m = prices[["product", "t", "mid_price"]].drop_duplicates(["product", "t"]).sort_values(["product", "t"]).copy()
-        m["future_mid"] = m.groupby("product")["mid_price"].shift(-horizon)
-        m["edge_buy"] = (m["future_mid"] - m["mid_price"]) / (m["mid_price"] + 1e-12)
-        tr = trades.merge(m[["product", "t", "edge_buy"]], on=["product", "t"], how="left").dropna(subset=["edge_buy"])
-        tr["edge_sell"] = -tr["edge_buy"]
-        b = tr.groupby("buyer")["edge_buy"].agg(["count", "mean"]).reset_index().rename(columns={"buyer": "trader"})
-        s = tr.groupby("seller")["edge_sell"].agg(["count", "mean"]).reset_index().rename(columns={"seller": "trader"})
-        out = pd.merge(b, s, on="trader", how="outer", suffixes=("_buy", "_sell")).fillna(0)
-        out["n_total"] = out["count_buy"] + out["count_sell"]
-        out["mean_edge"] = (
-            out["mean_buy"] * out["count_buy"] + out["mean_sell"] * out["count_sell"]
-        ) / (out["n_total"] + 1e-12)
-        top = out.sort_values("mean_edge", ascending=False).head(20)
-        st.dataframe(top[["trader", "n_total", "mean_edge"]], use_container_width=True)
-        fig = go.Figure([go.Bar(x=top["trader"], y=top["mean_edge"], marker_color=NEON["cyan"])])
-        set_plotly_layout(fig, "Counterparty Edge Leaderboard")
-        st.plotly_chart(fig, use_container_width=True)
-        strategy["counterparty_edge"] = top[["trader", "n_total", "mean_edge"]].head(10).to_dict("records")
+    try:
+        if trades.empty or "product" not in trades.columns:
+            st.info("Module 2 unavailable: trades data missing for selected rounds/files.")
+        else:
+            m = prices[["product", "t", "mid_price"]].drop_duplicates(["product", "t"]).sort_values(["product", "t"]).copy()
+            m["future_mid"] = m.groupby("product")["mid_price"].shift(-horizon)
+            m["edge_buy"] = (m["future_mid"] - m["mid_price"]) / (m["mid_price"] + 1e-12)
+            tr = trades.merge(m[["product", "t", "edge_buy"]], on=["product", "t"], how="left").dropna(subset=["edge_buy"])
+            if tr.empty:
+                st.info("Module 2 unavailable: no overlap between trade timestamps and price timeline.")
+            else:
+                tr["edge_sell"] = -tr["edge_buy"]
+                b = tr.groupby("buyer")["edge_buy"].agg(["count", "mean"]).reset_index().rename(columns={"buyer": "trader"})
+                s = tr.groupby("seller")["edge_sell"].agg(["count", "mean"]).reset_index().rename(columns={"seller": "trader"})
+                out = pd.merge(b, s, on="trader", how="outer", suffixes=("_buy", "_sell")).fillna(0)
+                out["n_total"] = out["count_buy"] + out["count_sell"]
+                out["mean_edge"] = (
+                    out["mean_buy"] * out["count_buy"] + out["mean_sell"] * out["count_sell"]
+                ) / (out["n_total"] + 1e-12)
+                top = out.sort_values("mean_edge", ascending=False).head(20)
+                st.dataframe(top[["trader", "n_total", "mean_edge"]], use_container_width=True)
+                fig = go.Figure([go.Bar(x=top["trader"], y=top["mean_edge"], marker_color=NEON["cyan"])])
+                set_plotly_layout(fig, "Counterparty Edge Leaderboard")
+                st.plotly_chart(fig, use_container_width=True)
+                strategy["counterparty_edge"] = top[["trader", "n_total", "mean_edge"]].head(10).to_dict("records")
+    except Exception as e:
+        st.error(f"Module 2 failed for current rounds/files: {e}")
 
 # Module 3
 with tabs[2]:
-    if not HAS_COINT:
-        st.warning("statsmodels not available. Cointegration scan skipped.")
-        strategy["stat_arb"] = {"pairs": []}
-    else:
-        pivot = (
-            prices[["product", "t", "mid_price"]]
-            .dropna()
-            .pivot_table(index="t", columns="product", values="mid_price", aggfunc="last")
-            .sort_index()
-        )
-        candidates = []
-        attempted_pairs = 0
-        skipped_short = 0
-        for a, b in itertools.combinations([c for c in products if c in pivot.columns], 2):
-            attempted_pairs += 1
-            pair = pivot[[a, b]].dropna()
-            if len(pair) < 200:
-                skipped_short += 1
-                continue
-            y = np.log(pair[a].values + 1e-12)
-            x = np.log(pair[b].values + 1e-12)
-            try:
-                _, p, _ = coint(y, x)
-                candidates.append((float(p), a, b))
-            except Exception:
-                pass
-        candidates.sort(key=lambda z: z[0])
-        best = candidates[:3]
-        st.caption(
-            f"Attempted pairs: {attempted_pairs} | "
-            f"with enough overlap (>=200): {attempted_pairs - skipped_short} | "
-            f"cointegration candidates: {len(candidates)}"
-        )
-
-        if not best:
-            st.info(
-                "No cointegrated pairs found for the current uploaded data/rounds under the current overlap threshold."
-            )
-            # Fallback: show top correlated pairs so user still gets guidance.
-            corr = pivot.corr().replace([np.inf, -np.inf], np.nan)
-            rows_fallback = []
-            cols = [c for c in products if c in corr.columns]
-            for a, b in itertools.combinations(cols, 2):
-                v = corr.loc[a, b]
-                if pd.notna(v):
-                    rows_fallback.append((a, b, float(v)))
-            rows_fallback.sort(key=lambda t: abs(t[2]), reverse=True)
-            top_corr = pd.DataFrame(rows_fallback[:10], columns=["a", "b", "corr"])
-            if not top_corr.empty:
-                st.write("Fallback: top correlated pairs")
-                st.dataframe(top_corr, use_container_width=True)
+    try:
+        if not HAS_COINT:
+            st.warning("Module 3 unavailable: statsmodels is not available (cointegration skipped).")
             strategy["stat_arb"] = {"pairs": []}
         else:
-            st.write("Top pairs:", best)
-            rows = []
-            for pval, a, b in best:
+            pivot = (
+                prices[["product", "t", "mid_price"]]
+                .dropna()
+                .pivot_table(index="t", columns="product", values="mid_price", aggfunc="last")
+                .sort_index()
+            )
+            candidates = []
+            attempted_pairs = 0
+            skipped_short = 0
+            for a, b in itertools.combinations([c for c in products if c in pivot.columns], 2):
+                attempted_pairs += 1
                 pair = pivot[[a, b]].dropna()
-                pair = pair.apply(pd.to_numeric, errors="coerce").dropna()
-                t = pair.index.values
+                if len(pair) < 200:
+                    skipped_short += 1
+                    continue
                 y = np.log(pair[a].values + 1e-12)
                 x = np.log(pair[b].values + 1e-12)
-                intercept, beta, resid = kalman_beta(y, x)
-                rs = pd.Series(resid)
-                win = min(300, max(60, len(rs) // 3))
-                z = (rs - rs.rolling(win, min_periods=max(20, win // 5)).mean()) / (
-                    rs.rolling(win, min_periods=max(20, win // 5)).std(ddof=0) + 1e-12
+                try:
+                    _, p, _ = coint(y, x)
+                    candidates.append((float(p), a, b))
+                except Exception:
+                    pass
+            candidates.sort(key=lambda z: z[0])
+            best = candidates[:3]
+            st.caption(
+                f"Attempted pairs: {attempted_pairs} | "
+                f"with enough overlap (>=200): {attempted_pairs - skipped_short} | "
+                f"cointegration candidates: {len(candidates)}"
+            )
+
+            if not best:
+                st.info(
+                    "Module 3 unavailable for this selection: no cointegrated pairs found under current overlap threshold."
                 )
-                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12)
-                fig.add_trace(go.Scatter(x=t, y=z, mode="lines", line=dict(color=NEON["cyan"]), name="z"), row=1, col=1)
-                for s in (1, 2, 3):
-                    fig.add_hline(y=s, line_dash="dash", line_color=NEON["red"], row=1, col=1)
-                    fig.add_hline(y=-s, line_dash="dash", line_color=NEON["red"], row=1, col=1)
-                fig.add_trace(go.Histogram(x=z.dropna(), nbinsx=60, marker_color=NEON["magenta"]), row=2, col=1)
-                set_plotly_layout(fig, f"{a} vs {b} (p={pval:.3g})")
-                st.plotly_chart(fig, use_container_width=True)
-                rows.append(
-                    {
-                        "pair": [a, b],
-                        "cointegration_pvalue": pval,
-                        "beta_latest": float(beta[-1]),
-                        "z_latest": float(z.dropna().iloc[-1]) if not z.dropna().empty else float("nan"),
-                        "hurst_resid": hurst_rs(resid),
-                    }
-                )
-            strategy["stat_arb"] = {"pairs": rows}
+                corr = pivot.corr().replace([np.inf, -np.inf], np.nan)
+                rows_fallback = []
+                cols = [c for c in products if c in corr.columns]
+                for a, b in itertools.combinations(cols, 2):
+                    v = corr.loc[a, b]
+                    if pd.notna(v):
+                        rows_fallback.append((a, b, float(v)))
+                rows_fallback.sort(key=lambda t: abs(t[2]), reverse=True)
+                top_corr = pd.DataFrame(rows_fallback[:10], columns=["a", "b", "corr"])
+                if not top_corr.empty:
+                    st.write("Fallback: top correlated pairs")
+                    st.dataframe(top_corr, use_container_width=True)
+                strategy["stat_arb"] = {"pairs": []}
+            else:
+                st.write("Top pairs:", best)
+                rows = []
+                for pval, a, b in best:
+                    pair = pivot[[a, b]].dropna()
+                    pair = pair.apply(pd.to_numeric, errors="coerce").dropna()
+                    t = pair.index.values
+                    y = np.log(pair[a].values + 1e-12)
+                    x = np.log(pair[b].values + 1e-12)
+                    intercept, beta, resid = kalman_beta(y, x)
+                    rs = pd.Series(resid)
+                    win = min(300, max(60, len(rs) // 3))
+                    z = (rs - rs.rolling(win, min_periods=max(20, win // 5)).mean()) / (
+                        rs.rolling(win, min_periods=max(20, win // 5)).std(ddof=0) + 1e-12
+                    )
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12)
+                    fig.add_trace(go.Scatter(x=t, y=z, mode="lines", line=dict(color=NEON["cyan"]), name="z"), row=1, col=1)
+                    for s in (1, 2, 3):
+                        fig.add_hline(y=s, line_dash="dash", line_color=NEON["red"], row=1, col=1)
+                        fig.add_hline(y=-s, line_dash="dash", line_color=NEON["red"], row=1, col=1)
+                    fig.add_trace(go.Histogram(x=z.dropna(), nbinsx=60, marker_color=NEON["magenta"]), row=2, col=1)
+                    set_plotly_layout(fig, f"{a} vs {b} (p={pval:.3g})")
+                    st.plotly_chart(fig, use_container_width=True)
+                    rows.append(
+                        {
+                            "pair": [a, b],
+                            "cointegration_pvalue": pval,
+                            "beta_latest": float(beta[-1]),
+                            "z_latest": float(z.dropna().iloc[-1]) if not z.dropna().empty else float("nan"),
+                            "hurst_resid": hurst_rs(resid),
+                        }
+                    )
+                strategy["stat_arb"] = {"pairs": rows}
+    except Exception as e:
+        st.error(f"Module 3 failed for current rounds/files: {e}")
+        strategy["stat_arb"] = {"pairs": []}
 
 # Module 4
 with tabs[3]:
+    st.caption(f"Module 4 input check: prices rows={len(prices):,}")
     pick = st.selectbox("Product for microstructure", options=products, index=0)
     p = prices[prices["product"] == pick].sort_values("t").copy()
-    bid_sum = p[["bid_volume_1", "bid_volume_2", "bid_volume_3"]].sum(axis=1, skipna=True)
-    ask_sum = p[["ask_volume_1", "ask_volume_2", "ask_volume_3"]].sum(axis=1, skipna=True)
-    p["obi"] = (bid_sum - ask_sum) / (bid_sum + ask_sum + 1e-12)
-    d_bid_qty = p["bid_volume_1"].diff().fillna(0)
-    d_ask_qty = p["ask_volume_1"].diff().fillna(0)
-    d_bid_px = p["bid_price_1"].diff().fillna(0)
-    d_ask_px = p["ask_price_1"].diff().fillna(0)
-    p["ofi"] = np.where(d_bid_px >= 0, d_bid_qty, -d_bid_qty) - np.where(d_ask_px <= 0, d_ask_qty, -d_ask_qty)
-    bpx = p[["bid_price_1", "bid_price_2", "bid_price_3"]].to_numpy(dtype=float)
-    bv = p[["bid_volume_1", "bid_volume_2", "bid_volume_3"]].to_numpy(dtype=float)
-    apx = p[["ask_price_1", "ask_price_2", "ask_price_3"]].to_numpy(dtype=float)
-    av = p[["ask_volume_1", "ask_volume_2", "ask_volume_3"]].to_numpy(dtype=float)
-    vb = np.nansum(bpx * bv, axis=1) / (np.nansum(bv, axis=1) + 1e-12)
-    va = np.nansum(apx * av, axis=1) / (np.nansum(av, axis=1) + 1e-12)
-    p["true_vwap"] = 0.5 * (vb + va)
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08)
-    fig.add_trace(go.Scatter(x=p["t"], y=p["obi"], mode="lines", line=dict(color=NEON["cyan"]), name="OBI"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=p["t"], y=p["ofi"], mode="lines", line=dict(color=NEON["magenta"]), name="OFI"), row=2, col=1)
-    fig.add_trace(
-        go.Scatter(x=p["t"], y=p["true_vwap"], mode="lines", line=dict(color=NEON["green"]), name="True VWAP"), row=3, col=1
-    )
-    fig.add_trace(go.Scatter(x=p["t"], y=p["mid_price"], mode="lines", line=dict(color=NEON["red"]), name="Mid"), row=3, col=1)
-    set_plotly_layout(fig, f"Microstructure: {pick}")
-    st.plotly_chart(fig, use_container_width=True)
-    strategy["microstructure"] = {
-        "product": pick,
-        "obi_latest": float(p["obi"].iloc[-1]),
-        "ofi_latest": float(p["ofi"].iloc[-1]),
-        "true_vwap_latest": float(p["true_vwap"].iloc[-1]),
-        "mid_latest": float(p["mid_price"].iloc[-1]),
-    }
+    req4 = [
+        "t",
+        "mid_price",
+        "bid_price_1",
+        "bid_volume_1",
+        "bid_price_2",
+        "bid_volume_2",
+        "bid_price_3",
+        "bid_volume_3",
+        "ask_price_1",
+        "ask_volume_1",
+        "ask_price_2",
+        "ask_volume_2",
+        "ask_price_3",
+        "ask_volume_3",
+    ]
+    miss4 = [c for c in req4 if c not in p.columns]
+    if p.empty:
+        st.warning("No rows for selected product in Module 4.")
+    elif miss4:
+        st.warning(f"Module 4 missing columns: {miss4}")
+    else:
+        bid_sum = p[["bid_volume_1", "bid_volume_2", "bid_volume_3"]].sum(axis=1, skipna=True)
+        ask_sum = p[["ask_volume_1", "ask_volume_2", "ask_volume_3"]].sum(axis=1, skipna=True)
+        p["obi"] = (bid_sum - ask_sum) / (bid_sum + ask_sum + 1e-12)
+        d_bid_qty = p["bid_volume_1"].diff().fillna(0)
+        d_ask_qty = p["ask_volume_1"].diff().fillna(0)
+        d_bid_px = p["bid_price_1"].diff().fillna(0)
+        d_ask_px = p["ask_price_1"].diff().fillna(0)
+        p["ofi"] = np.where(d_bid_px >= 0, d_bid_qty, -d_bid_qty) - np.where(d_ask_px <= 0, d_ask_qty, -d_ask_qty)
+        bpx = p[["bid_price_1", "bid_price_2", "bid_price_3"]].to_numpy(dtype=float)
+        bv = p[["bid_volume_1", "bid_volume_2", "bid_volume_3"]].to_numpy(dtype=float)
+        apx = p[["ask_price_1", "ask_price_2", "ask_price_3"]].to_numpy(dtype=float)
+        av = p[["ask_volume_1", "ask_volume_2", "ask_volume_3"]].to_numpy(dtype=float)
+        vb = np.nansum(bpx * bv, axis=1) / (np.nansum(bv, axis=1) + 1e-12)
+        va = np.nansum(apx * av, axis=1) / (np.nansum(av, axis=1) + 1e-12)
+        p["true_vwap"] = 0.5 * (vb + va)
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08)
+        fig.add_trace(go.Scatter(x=p["t"], y=p["obi"], mode="lines", line=dict(color=NEON["cyan"]), name="OBI"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=p["t"], y=p["ofi"], mode="lines", line=dict(color=NEON["magenta"]), name="OFI"), row=2, col=1)
+        fig.add_trace(
+            go.Scatter(x=p["t"], y=p["true_vwap"], mode="lines", line=dict(color=NEON["green"]), name="True VWAP"), row=3, col=1
+        )
+        fig.add_trace(go.Scatter(x=p["t"], y=p["mid_price"], mode="lines", line=dict(color=NEON["red"]), name="Mid"), row=3, col=1)
+        set_plotly_layout(fig, f"Microstructure: {pick}")
+        st.plotly_chart(fig, use_container_width=True)
+        strategy["microstructure"] = {
+            "product": pick,
+            "obi_latest": float(p["obi"].iloc[-1]),
+            "ofi_latest": float(p["ofi"].iloc[-1]),
+            "true_vwap_latest": float(p["true_vwap"].iloc[-1]),
+            "mid_latest": float(p["mid_price"].iloc[-1]),
+        }
 
 # Module 5
 with tabs[4]:
+    st.caption(f"Module 5 input check: observations rows={len(obs):,}")
     local = "ORCHIDS" if "ORCHIDS" in products else ("MAGNIFICENT_MACARONS" if "MAGNIFICENT_MACARONS" in products else None)
     if local is None or obs.empty:
         st.info("No environmental fair-value product/observations available.")
@@ -484,46 +528,51 @@ with tabs[4]:
         else:
             o = o[req]
             df = loc.merge(o, on="t", how="inner").sort_values("t")
-            df["implied_bid"] = df["bidPrice"] - df["exportTariff"] - df["transportFees"]
-            df["implied_ask"] = df["askPrice"] + df["importTariff"] + df["transportFees"]
-            df["center"] = 0.5 * (df["implied_bid"] + df["implied_ask"])
-            y = (df["mid_price"] - df["center"]).to_numpy(float)
-            sun = df["sunlightIndex"].to_numpy(float)
-            hum = df["humidity"].to_numpy(float)
-            sun_z = (sun - np.nanmean(sun)) / (np.nanstd(sun) + 1e-12)
-            hum_z = (hum - np.nanmean(hum)) / (np.nanstd(hum) + 1e-12)
-            X = np.column_stack([np.ones(len(df)), sun_z, hum_z])
-            b, *_ = np.linalg.lstsq(X, y, rcond=None)
-            df["fair"] = df["center"] + X @ b
-            df["offset"] = df["mid_price"] - df["fair"]
-            fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08)
-            fig.add_trace(go.Scatter(x=df["t"], y=df["mid_price"], mode="lines", line=dict(color=NEON["green"]), name="Local"), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df["t"], y=df["implied_bid"], mode="lines", line=dict(color=NEON["cyan"], dash="dot"), name="ImpBid"), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df["t"], y=df["implied_ask"], mode="lines", line=dict(color=NEON["magenta"], dash="dot"), name="ImpAsk"), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df["t"], y=df["fair"], mode="lines", line=dict(color=NEON["purple"]), name="Fair"), row=2, col=1)
-            fig.add_trace(go.Scatter(x=df["t"], y=df["offset"], mode="lines", line=dict(color=NEON["yellow"]), name="Offset"), row=2, col=1)
-            fig.add_trace(go.Scatter(x=df["t"], y=df["sunlightIndex"], mode="lines", line=dict(color=NEON["yellow"]), name="Sun"), row=3, col=1)
-            fig.add_trace(go.Scatter(x=df["t"], y=df["humidity"], mode="lines", line=dict(color=NEON["magenta"]), name="Hum"), row=3, col=1)
-            set_plotly_layout(fig, f"Environmental Fair Value ({local})")
-            st.plotly_chart(fig, use_container_width=True)
-            strategy["fair_value_environment"] = {
-                "local_product": local,
-                "fv_offset_latest": float(df["offset"].iloc[-1]),
-                "fair_latest": float(df["fair"].iloc[-1]),
-                "local_mid_latest": float(df["mid_price"].iloc[-1]),
-                "sunlight_latest": float(df["sunlightIndex"].iloc[-1]),
-                "humidity_latest": float(df["humidity"].iloc[-1]),
-            }
+            if df.empty:
+                st.warning("Module 5 has no overlapping timestamps between local price and observations.")
+                strategy["fair_value_environment"] = {}
+            else:
+                df["implied_bid"] = df["bidPrice"] - df["exportTariff"] - df["transportFees"]
+                df["implied_ask"] = df["askPrice"] + df["importTariff"] + df["transportFees"]
+                df["center"] = 0.5 * (df["implied_bid"] + df["implied_ask"])
+                y = (df["mid_price"] - df["center"]).to_numpy(float)
+                sun = df["sunlightIndex"].to_numpy(float)
+                hum = df["humidity"].to_numpy(float)
+                sun_z = (sun - np.nanmean(sun)) / (np.nanstd(sun) + 1e-12)
+                hum_z = (hum - np.nanmean(hum)) / (np.nanstd(hum) + 1e-12)
+                X = np.column_stack([np.ones(len(df)), sun_z, hum_z])
+                b, *_ = np.linalg.lstsq(X, y, rcond=None)
+                df["fair"] = df["center"] + X @ b
+                df["offset"] = df["mid_price"] - df["fair"]
+                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08)
+                fig.add_trace(go.Scatter(x=df["t"], y=df["mid_price"], mode="lines", line=dict(color=NEON["green"]), name="Local"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df["t"], y=df["implied_bid"], mode="lines", line=dict(color=NEON["cyan"], dash="dot"), name="ImpBid"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df["t"], y=df["implied_ask"], mode="lines", line=dict(color=NEON["magenta"], dash="dot"), name="ImpAsk"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df["t"], y=df["fair"], mode="lines", line=dict(color=NEON["purple"]), name="Fair"), row=2, col=1)
+                fig.add_trace(go.Scatter(x=df["t"], y=df["offset"], mode="lines", line=dict(color=NEON["yellow"]), name="Offset"), row=2, col=1)
+                fig.add_trace(go.Scatter(x=df["t"], y=df["sunlightIndex"], mode="lines", line=dict(color=NEON["yellow"]), name="Sun"), row=3, col=1)
+                fig.add_trace(go.Scatter(x=df["t"], y=df["humidity"], mode="lines", line=dict(color=NEON["magenta"]), name="Hum"), row=3, col=1)
+                set_plotly_layout(fig, f"Environmental Fair Value ({local})")
+                st.plotly_chart(fig, use_container_width=True)
+                strategy["fair_value_environment"] = {
+                    "local_product": local,
+                    "fv_offset_latest": float(df["offset"].iloc[-1]),
+                    "fair_latest": float(df["fair"].iloc[-1]),
+                    "local_mid_latest": float(df["mid_price"].iloc[-1]),
+                    "sunlight_latest": float(df["sunlightIndex"].iloc[-1]),
+                    "humidity_latest": float(df["humidity"].iloc[-1]),
+                }
 
 # Module 6
 with tabs[5]:
+    st.caption(f"Module 6 input check: prices rows={len(prices):,}")
     pick6 = st.selectbox("Product for spectral analysis", options=products, index=0, key="spec_prod")
     s = prices[prices["product"] == pick6].sort_values("t").copy()
     s["ret"] = np.log(s["mid_price"] + 1e-12).diff()
     rv = s["ret"].dropna().to_numpy(float)
     W = min(512, max(128, len(rv) // 4))
     if len(rv) < W + 10:
-        st.info("Not enough data for rolling FFT.")
+        st.warning(f"Not enough data for rolling FFT (need > {W+10}, got {len(rv)}).")
     else:
         step = max(1, (len(rv) - W) // 80)
         freq = np.fft.rfftfreq(W, d=1.0)
@@ -551,6 +600,7 @@ with tabs[5]:
 
 # Module 7
 with tabs[6]:
+    st.caption(f"Module 7 input check: prices rows={len(prices):,}")
     pick7 = st.selectbox("Product for entropy", options=products, index=0, key="ent_prod")
     p = prices[prices["product"] == pick7].sort_values("t").copy()
     vols = p[["bid_volume_1", "bid_volume_2", "bid_volume_3", "ask_volume_1", "ask_volume_2", "ask_volume_3"]].to_numpy(float)
@@ -580,6 +630,7 @@ with tabs[6]:
 
 # Module 8
 with tabs[7]:
+    st.caption(f"Module 8 input check: prices rows={len(prices):,}")
     pick8 = st.selectbox("Product for liquidity void", options=products, index=0, key="void_prod")
     p = prices[prices["product"] == pick8].sort_values("t").copy()
     p["future_mid"] = p["mid_price"].shift(-horizon)
