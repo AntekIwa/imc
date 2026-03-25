@@ -1,21 +1,53 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 import scipy.stats as stats
-from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.stattools import adfuller, coint
+from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
 
-# --- KONFIGURACJA STRONY I ESTETYKI ---
-st.set_page_config(page_title="IMC Prosperity 4 - Quant Terminal", layout="wide", page_icon="📈")
+# --- 1. KONFIGURACJA STRONY ---
+st.set_page_config(page_title="IMC Prosperity 4 - Lewiatan", layout="wide", page_icon="🐋")
+COLOR_UP = '#00E676'
+COLOR_DOWN = '#FF1744'
+COLOR_NEUT = '#00B0FF'
 
-# Ustawienia profesjonalnego wyglądu wykresów (stylizacja Bloomberg-like)
-plt.style.use('dark_background')
-sns.set_context("notebook", font_scale=1.1)
-COLOR_UP = '#00ff00'
-COLOR_DOWN = '#ff0000'
-COLOR_NEUTRAL = '#00ccff'
+# --- 2. FUNKCJE MATEMATYCZNE I QUANTOWE ---
+def calculate_hurst(ts, max_lag=20):
+    """Oblicza wykładnik Hursta. H<0.5 (Mean Reverting), H=0.5 (Random Walk), H>0.5 (Trend)."""
+    lags = range(2, max_lag)
+    tau = [np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag]))) for lag in lags]
+    poly = np.polyfit(np.log(lags), np.log(tau), 1)
+    return poly[0] * 2.0
+
+def markov_chain_matrix(price_series):
+    """Tworzy macierz prawdopodobieństw przejść dla ruchów ceny (Up, Down, Flat)."""
+    diffs = np.sign(price_series.diff().dropna())
+    states = diffs.map({1.0: 'Up', -1.0: 'Down', 0.0: 'Flat'})
+    transitions = pd.crosstab(states.shift(), states, normalize='index')
+    return transitions
+
+def bs_greeks(S, K, T, r, sigma, option_type='call'):
+    """Oblicza pełny zestaw Greków dla modelu Blacka-Scholesa."""
+    d1 = (np.log(S/K) + (r + 0.5 * sigma**2)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+    
+    if option_type == 'call':
+        price = S*stats.norm.cdf(d1) - K*np.exp(-r*T)*stats.norm.cdf(d2)
+        delta = stats.norm.cdf(d1)
+        theta = (-S*stats.norm.pdf(d1)*sigma / (2*np.sqrt(T))) - r*K*np.exp(-r*T)*stats.norm.cdf(d2)
+    else:
+        price = K*np.exp(-r*T)*stats.norm.cdf(-d2) - S*stats.norm.cdf(-d1)
+        delta = stats.norm.cdf(d1) - 1
+        theta = (-S*stats.norm.pdf(d1)*sigma / (2*np.sqrt(T))) + r*K*np.exp(-r*T)*stats.norm.cdf(-d2)
+        
+    gamma = stats.norm.pdf(d1) / (S*sigma*np.sqrt(T))
+    vega = S*stats.norm.pdf(d1)*np.sqrt(T)
+    return price, delta, gamma, theta, vega
 
 @st.cache_data
 def load_data(file, sep):
@@ -23,462 +55,353 @@ def load_data(file, sep):
         try:
             return pd.read_csv(file, sep=sep)
         except Exception as e:
-            st.error(f"Błąd wczytywania pliku: {e}")
+            st.error(f"Błąd: {e}")
     return None
 
-# --- SIDEBAR: WGRYWANIE DANYCH ---
+# --- 3. SIDEBAR ---
 with st.sidebar:
-    st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/Sars-cov-2_SARS-CoV-2_spike_protein.png/120px-Sars-cov-2_SARS-CoV-2_spike_protein.png", width=50) # Placeholder logo
-    st.header("⚙️ Terminal Danych")
-    separator = st.selectbox("Separator CSV", [";", ","])
-    prices_file = st.file_uploader("1. Wgraj Prices (prices.csv)", type=['csv'])
-    trades_file = st.file_uploader("2. Wgraj Trades (trades.csv)", type=['csv'])
+    st.header("🐋 Terminal Lewiatan")
+    sep = st.selectbox("Separator", [";", ","])
+    f_prices = st.file_uploader("1. Wgraj prices.csv", type=['csv'])
+    f_trades = st.file_uploader("2. Wgraj trades.csv", type=['csv'])
+    
     st.markdown("---")
-    st.markdown("### 🛠️ Opcje Wykresów")
-    chart_ma_fast = st.slider("Szybka EMA", 5, 50, 10)
-    chart_ma_slow = st.slider("Wolna EMA", 20, 200, 50)
+    st.markdown("### ⚙️ Hiperparametry")
+    chart_bucket = st.slider("Agregacja Świec (Kroki)", 100, 5000, 500)
+    roll_win = st.slider("Okno Kroczące (MA/Z-Score)", 10, 500, 50)
 
-prices_df = load_data(prices_file, separator)
-trades_df = load_data(trades_file, separator)
+prices_df = load_data(f_prices, sep)
+trades_df = load_data(f_trades, sep)
 
-st.title("📈 IMC Prosperity 4 - Advanced Quant Terminal")
-st.markdown("Kompleksowe narzędzie do analizy mikrostruktury rynku, arbitrażu statystycznego i zachowań algorytmicznych (Order Flow).")
+st.title("🐋 Projekt Lewiatan - Advanced Quant Environment")
 
 if prices_df is not None:
     products = prices_df['product'].unique().tolist()
     
-    # Przebudowany system zakładek na 12 potężnych modułów
     tabs = st.tabs([
-        "🕯️ Price Action & Zmienność", 
-        "📊 Volume Profile & CVD", 
-        "🔗 Arbitraż & Korelacje", 
-        "⏱️ Lead-Lag Analysis",
-        "⚖️ Order Book Imbalance", 
-        "🕵️ Tape Reading (ID)", 
-        "🤖 Bot Fingerprint (Blind)", 
-        "🌊 Sygnały & Obserwacje", 
-        "📈 Opcje (Black-Scholes)",
-        "📚 Deep L2/L3 VWAP",
-        "🔄 Autokorelacja (ACF)",
-        "💰 Backtester Sandbox"
+        "🔬 Mikrostruktura & Micro-Price", 
+        "🎲 Łańcuchy Markowa & Hurst", 
+        "🔗 Kointegracja (Stat-Arb)", 
+        "🌊 Order Flow Imbalance (OFI)", 
+        "🧠 ML: Reżimy & Cechy", 
+        "🧮 Greki Opcji (B-S)", 
+        "🕵️ Tape Reading (VPIN)",
+        "💰 Backtester & Kelly"
     ])
 
     # ==========================================
-    # ZAKŁADKA 1: PRICE ACTION & BOLLINGER BANDS
+    # ZAKŁADKA 1: MIKROSTRUKTURA & MICRO-PRICE
     # ==========================================
     with tabs[0]:
-        st.header("Analiza Ceny, Trendu i Zmienności")
-        prod_1 = st.selectbox("Wybierz aktywo:", products, key='t1_prod')
-        df_p1 = prices_df[prices_df['product'] == prod_1].copy()
+        st.header("Mikrostruktura i Micro-Price")
+        st.write("Ważona cena mikrostrukturalna szybciej reaguje na ukrytą presję w arkuszu niż standardowy Mid-Price.")
         
-        # Obliczenia techniczne
-        df_p1['EMA_Fast'] = df_p1['mid_price'].ewm(span=chart_ma_fast).mean()
-        df_p1['EMA_Slow'] = df_p1['mid_price'].ewm(span=chart_ma_slow).mean()
-        bb_window = 20
-        df_p1['BB_Mid'] = df_p1['mid_price'].rolling(window=bb_window).mean()
-        df_p1['BB_Std'] = df_p1['mid_price'].rolling(window=bb_window).std()
-        df_p1['BB_Upper'] = df_p1['BB_Mid'] + (df_p1['BB_Std'] * 2)
-        df_p1['BB_Lower'] = df_p1['BB_Mid'] - (df_p1['BB_Std'] * 2)
-
-        fig1, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10), gridspec_kw={'height_ratios': [3, 1]}, sharex=True)
+        prod_1 = st.selectbox("Aktywo:", products, key='t1_p')
+        df_1 = prices_df[prices_df['product'] == prod_1].copy()
         
-        # Główny wykres ceny
-        ax1.plot(df_p1['timestamp'], df_p1['mid_price'], color='white', label='Mid Price', linewidth=1.5)
-        ax1.plot(df_p1['timestamp'], df_p1['EMA_Fast'], color='#00ffcc', label=f'EMA {chart_ma_fast}', alpha=0.8)
-        ax1.plot(df_p1['timestamp'], df_p1['EMA_Slow'], color='#ff00ff', label=f'EMA {chart_ma_slow}', alpha=0.8)
-        ax1.fill_between(df_p1['timestamp'], df_p1['BB_Lower'], df_p1['BB_Upper'], color='#336699', alpha=0.2, label='Bollinger Bands (20, 2)')
-        
-        if 'bid_price_1' in df_p1.columns:
-            ax1.fill_between(df_p1['timestamp'], df_p1['bid_price_1'], df_p1['ask_price_1'], color='#444444', alpha=0.5, label='Spread')
+        if 'bid_volume_1' in df_1.columns and 'ask_volume_1' in df_1.columns:
+            # Kalkulacja Micro-Price (Ważona płynnością przeciwną)
+            # Wzór: P_micro = (Bid * AskVol + Ask * BidVol) / (BidVol + AskVol)
+            df_1['Micro_Price'] = (df_1['bid_price_1'] * df_1['ask_volume_1'] + df_1['ask_price_1'] * df_1['bid_volume_1']) / (df_1['bid_volume_1'] + df_1['ask_volume_1'])
+            df_1['Spread'] = df_1['ask_price_1'] - df_1['bid_price_1']
             
-        ax1.set_title(f"Price Action & Wstęgi Bollingera: {prod_1}", fontsize=16)
-        ax1.legend(loc='upper left')
-        ax1.grid(color='#333333', linestyle='--')
-
-        # Wykres zmienności (Spread & ATR proxy)
-        if 'bid_price_1' in df_p1.columns:
-            df_p1['Spread'] = df_p1['ask_price_1'] - df_p1['bid_price_1']
-            ax2.plot(df_p1['timestamp'], df_p1['Spread'], color='#ffff00', label='Bid-Ask Spread')
-            ax2.set_title("Dynamika Spreadu", fontsize=12)
-            ax2.legend(loc='upper left')
-            ax2.grid(color='#333333', linestyle='--')
-
-        st.pyplot(fig1)
+            fig1 = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
+            fig1.add_trace(go.Scatter(x=df_1['timestamp'], y=df_1['mid_price'], name='Mid Price', line=dict(color='gray', width=1)), row=1, col=1)
+            fig1.add_trace(go.Scatter(x=df_1['timestamp'], y=df_1['Micro_Price'], name='Micro-Price', line=dict(color=COLOR_NEUT, width=2)), row=1, col=1)
+            fig1.add_trace(go.Scatter(x=df_1['timestamp'], y=df_1['Spread'], name='Spread', line=dict(color='yellow')), row=2, col=1)
+            
+            fig1.update_layout(height=600, template='plotly_dark', title="Micro-Price vs Mid-Price z Dynamiką Spreadu")
+            st.plotly_chart(fig1, use_container_width=True)
+            
+            c1, c2 = st.columns(2)
+            c1.metric("Średni Spread", f"{df_1['Spread'].mean():.2f}")
+            c2.metric("Maksymalny Spread (Flash Crash)", f"{df_1['Spread'].max():.2f}")
+        else:
+            st.warning("Brak danych poziomu 1 arkusza z wolumenem.")
 
     # ==========================================
-    # ZAKŁADKA 2: VOLUME PROFILE & CVD
+    # ZAKŁADKA 2: ŁAŃCUCHY MARKOWA I HURST EXPONENT
     # ==========================================
     with tabs[1]:
-        st.header("Mikrostruktura Wolumenu (Volume Profile & CVD)")
-        if trades_df is not None:
-            prod_2 = st.selectbox("Wybierz aktywo:", products, key='t2_prod')
-            df_t2 = trades_df[trades_df['product'] == prod_2].copy()
+        st.header("Prawdopodobieństwo i Pamięć Szeregu Czasowego")
+        prod_2 = st.selectbox("Aktywo:", products, key='t2_p')
+        ts_2 = prices_df[prices_df['product'] == prod_2]['mid_price'].dropna().values
+        
+        c2_1, c2_2 = st.columns(2)
+        
+        with c2_1:
+            st.subheader("Wykładnik Hursta (Hurst Exponent)")
+            st.latex(r"E\left[\frac{R(n)}{S(n)}\right] = C n^H")
             
-            # Wstępne przypisanie kierunku transakcji (Tick Rule) dla CVD
-            df_t2['price_change'] = df_t2['price'].diff()
-            df_t2['trade_dir'] = np.where(df_t2['price_change'] > 0, 1, np.where(df_t2['price_change'] < 0, -1, 0))
-            # Wypełniamy zera poprzednim kierunkiem
-            df_t2['trade_dir'] = df_t2['trade_dir'].replace(0, method='ffill').fillna(1) 
-            df_t2['signed_vol'] = df_t2['quantity'] * df_t2['trade_dir']
-            df_t2['CVD'] = df_t2['signed_vol'].cumsum()
+            if len(ts_2) > 100:
+                h_val = calculate_hurst(ts_2)
+                st.metric("Hurst Exponent (H)", f"{h_val:.4f}")
+                
+                if h_val < 0.45:
+                    st.success("H < 0.5: Szereg silnie powracający do średniej (Mean-Reverting). Graj Market Making i Stat-Arb!")
+                elif h_val > 0.55:
+                    st.error("H > 0.5: Szereg podążający za trendem (Trending). Graj Momentum, nie łap spadających noży!")
+                else:
+                    st.warning("H ≈ 0.5: Random Walk (Błądzenie Losowe). Rynek nieprzewidywalny.")
+            else:
+                st.write("Za mało danych dla Hursta.")
 
-            col_vp1, col_vp2 = st.columns([1, 2])
+        with c2_2:
+            st.subheader("Łańcuchy Markowa (Transition Matrix)")
+            st.write("Jakie jest prawdopodobieństwo ruchu w górę, jeśli poprzedni krok też był w górę?")
             
-            with col_vp1:
-                # Volume Profile
-                st.subheader("Volume Profile (VP)")
-                st.write("Wykrywanie stref wsparcia/oporu.")
-                vp_data = df_t2.groupby('price')['quantity'].sum().reset_index()
-                fig2a, ax2a = plt.subplots(figsize=(6, 8))
-                ax2a.barh(vp_data['price'], vp_data['quantity'], color=COLOR_NEUTRAL, alpha=0.7)
-                
-                # Znajdź POC (Point of Control)
-                poc_price = vp_data.loc[vp_data['quantity'].idxmax(), 'price']
-                ax2a.axhline(poc_price, color='red', linestyle='-', linewidth=2, label=f'POC: {poc_price}')
-                ax2a.set_xlabel("Całkowity Wolumen")
-                ax2a.set_ylabel("Cena Transakcji")
-                ax2a.legend()
-                ax2a.grid(color='#333333', linestyle='--')
-                st.pyplot(fig2a)
-
-            with col_vp2:
-                # Cumulative Volume Delta (CVD)
-                st.subheader("Cumulative Volume Delta (CVD)")
-                st.write("Mierzy siłę agresywnych kupujących vs sprzedających w czasie.")
-                fig2b, ax2b1 = plt.subplots(figsize=(10, 8))
-                ax2b2 = ax2b1.twinx()
-                
-                df_p2 = prices_df[prices_df['product'] == prod_2]
-                ax2b1.plot(df_p2['timestamp'], df_p2['mid_price'], color='white', label='Mid Price', alpha=0.7)
-                ax2b2.plot(df_t2['timestamp'], df_t2['CVD'], color='#ff9900', label='CVD', linewidth=2)
-                
-                ax2b1.set_ylabel("Cena")
-                ax2b2.set_ylabel("Skumulowana Delta Wolumenu")
-                
-                # Poprawka dla legendy
-                lines_1, labels_1 = ax2b1.get_legend_handles_labels()
-                lines_2, labels_2 = ax2b2.get_legend_handles_labels()
-                ax2b1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper left')
-                ax2b1.grid(color='#333333', linestyle='--')
-                st.pyplot(fig2b)
-        else:
-            st.warning("Ta sekcja wymaga wgrania pliku trades.csv")
+            ts_series = pd.Series(ts_2)
+            trans_matrix = markov_chain_matrix(ts_series)
+            
+            fig2 = go.Figure(data=go.Heatmap(
+                   z=trans_matrix.values,
+                   x=trans_matrix.columns,
+                   y=trans_matrix.index,
+                   colorscale='Viridis', text=np.round(trans_matrix.values, 2), texttemplate="%{text}"))
+            fig2.update_layout(template='plotly_dark', height=400, xaxis_title="Obecny Stan", yaxis_title="Poprzedni Stan")
+            st.plotly_chart(fig2, use_container_width=True)
 
     # ==========================================
-    # ZAKŁADKA 3: STAT-ARB & KORELACJE
+    # ZAKŁADKA 3: KOINTEGRACJA I ARBITRAŻ
     # ==========================================
     with tabs[2]:
-        st.header("Arbitraż Statystyczny (Pairs Trading / Baskets)")
+        st.header("Test Kointegracji Engle'a-Grangera")
+        st.write("Prosta korelacja to za mało. Kointegracja udowadnia, że spread między aktywami zawsze wraca do zera.")
+        
         pivot = prices_df.pivot(index='timestamp', columns='product', values='mid_price').ffill()
-        returns = pivot.pct_change().dropna()
         
-        st.subheader("Matryca Korelacji Stóp Zwrotu")
-        fig3, ax3 = plt.subplots(figsize=(12, 6))
-        sns.heatmap(returns.corr(), annot=True, cmap='coolwarm', vmin=-1, vmax=1, center=0, fmt='.2f', ax=ax3, linewidths=.5)
-        st.pyplot(fig3)
+        c3_1, c3_2 = st.columns(2)
+        prod_a = c3_1.selectbox("Aktywo A", products, index=0, key='t3_pa')
+        prod_b = c3_2.selectbox("Aktywo B", products, index=min(1, len(products)-1), key='t3_pb')
         
-        st.markdown("---")
-        st.subheader("Analiza Spreadu (Z-Score)")
-        c_sa1, c_sa2, c_sa3 = st.columns(3)
-        prod_sa_a = c_sa1.selectbox("Aktywo A (LONG)", products, index=0)
-        prod_sa_b = c_sa2.selectbox("Aktywo B (SHORT)", products, index=min(1, len(products)-1))
-        z_win = c_sa3.slider("Okno średniej kroczącej Z-Score", 10, 1000, 100)
-        
-        if prod_sa_a != prod_sa_b:
-            spread = pivot[prod_sa_a] - pivot[prod_sa_b]
-            mean_spread = spread.rolling(window=z_win).mean()
-            std_spread = spread.rolling(window=z_win).std()
-            z_score = (spread - mean_spread) / std_spread
+        if prod_a != prod_b:
+            ts_a = pivot[prod_a].dropna()
+            ts_b = pivot[prod_b].dropna()
             
-            fig_sa, (ax_sa1, ax_sa2) = plt.subplots(2, 1, figsize=(16, 8), sharex=True)
-            ax_sa1.plot(spread, color=COLOR_NEUTRAL, label=f'Spread Rzeczywisty ({prod_sa_a} - {prod_sa_b})')
-            ax_sa1.plot(mean_spread, color='yellow', linestyle='--', label=f'Średnia Spreadu ({z_win})')
-            ax_sa1.legend(); ax_sa1.set_title("Historia Spreadu Ceny")
-            ax_sa1.grid(color='#333333', linestyle='--')
+            # Wyrównanie długości
+            min_len = min(len(ts_a), len(ts_b))
+            ts_a = ts_a.iloc[:min_len]; ts_b = ts_b.iloc[:min_len]
             
-            ax_sa2.plot(z_score, color='#ff00ff', label='Z-Score Spreadu')
-            ax_sa2.axhline(2, color=COLOR_DOWN, linestyle='--', label='+2 (Sygnał Sell A / Buy B)')
-            ax_sa2.axhline(-2, color=COLOR_UP, linestyle='--', label='-2 (Sygnał Buy A / Sell B)')
-            ax_sa2.axhline(0, color='gray', linestyle='-')
-            ax_sa2.legend(); ax_sa2.set_title("Z-Score (Sygnały Mean-Reversion)")
-            ax_sa2.grid(color='#333333', linestyle='--')
-            st.pyplot(fig_sa)
+            score, p_value, _ = coint(ts_a, ts_b)
+            
+            st.metric("P-Value Kointegracji", f"{p_value:.5f}")
+            if p_value < 0.05:
+                st.success("✅ Szeregi są skointegrowane! Spread jest stacjonarny. Idealne warunki do Pairs Tradingu.")
+            else:
+                st.error("❌ Szeregi NIE SĄ skointegrowane. Spread może odjechać w nieskończoność. Arbitraż bardzo ryzykowny.")
+                
+            # Hedge Ratio (Zwykła regresja OLS)
+            slope, intercept, r_val, p_val, std_err = stats.linregress(ts_b, ts_a)
+            spread_coint = ts_a - (slope * ts_b)
+            z_coint = (spread_coint - spread_coint.mean()) / spread_coint.std()
+            
+            fig3 = make_subplots(rows=2, cols=1, shared_xaxes=True)
+            fig3.add_trace(go.Scatter(x=ts_a.index, y=ts_a, name=f'{prod_a}'), row=1, col=1)
+            fig3.add_trace(go.Scatter(x=ts_b.index, y=ts_b * slope, name=f'{prod_b} * {slope:.2f}'), row=1, col=1)
+            fig3.add_trace(go.Scatter(x=ts_a.index, y=z_coint, name='Z-Score Spreadu', line=dict(color='magenta')), row=2, col=1)
+            fig3.add_hline(y=2.0, line_dash="dash", line_color=COLOR_DOWN, row=2, col=1)
+            fig3.add_hline(y=-2.0, line_dash="dash", line_color=COLOR_UP, row=2, col=1)
+            
+            fig3.update_layout(height=600, template='plotly_dark', title=f"Kointegracja: Hedge Ratio = {slope:.3f}")
+            st.plotly_chart(fig3, use_container_width=True)
 
     # ==========================================
-    # ZAKŁADKA 4: LEAD-LAG ANALYSIS
+    # ZAKŁADKA 4: ORDER FLOW IMBALANCE (OFI)
     # ==========================================
     with tabs[3]:
-        st.header("Analiza Wyprzedzenia (Lead-Lag Relationship)")
-        st.write("Sprawdź, czy zmiana ceny jednego produktu systematycznie wyprzedza (o $N$ timestampów) ruchy innego.")
+        st.header("Order Flow Imbalance (OFI)")
+        st.write("Dynamiczna zmiana arkusza zleceń w czasie. Silny predyktor krótkoterminowych ruchów cenowych.")
         
-        c_ll1, c_ll2, c_ll3 = st.columns(3)
-        prod_lead = c_ll1.selectbox("Potencjalny Lider (Lead)", products, index=0, key='ll1')
-        prod_lag = c_ll2.selectbox("Potencjalny Naśladowca (Lag)", products, index=min(1, len(products)-1), key='ll2')
-        max_lag = c_ll3.slider("Maksymalne przesunięcie (Kroki)", 1, 50, 20)
-
-        if prod_lead != prod_lag:
-            s_lead = returns[prod_lead]
-            s_lag = returns[prod_lag]
+        prod_4 = st.selectbox("Aktywo:", products, key='t4_p')
+        df_4 = prices_df[prices_df['product'] == prod_4].copy()
+        
+        if 'bid_volume_1' in df_4.columns:
+            # Kalkulacja OFI (Uproszczona wersja modelu Conta)
+            df_4['prev_bid'] = df_4['bid_price_1'].shift(1)
+            df_4['prev_ask'] = df_4['ask_price_1'].shift(1)
+            df_4['prev_bid_vol'] = df_4['bid_volume_1'].shift(1)
+            df_4['prev_ask_vol'] = df_4['ask_volume_1'].shift(1)
             
-            corrs = []
-            lags_range = range(-max_lag, max_lag + 1)
-            for l in lags_range:
-                # Jeśli l jest dodatnie, przesuwamy 'Lead' do przodu (sprawdzamy, czy Lead_t tłumaczy Lag_{t+l})
-                corrs.append(s_lag.corr(s_lead.shift(l)))
-                
-            fig_ll, ax_ll = plt.subplots(figsize=(12, 6))
-            ax_ll.bar(lags_range, corrs, color=np.where(np.array(lags_range)<0, '#aaaaaa', COLOR_NEUTRAL))
-            ax_ll.axvline(0, color='red', linestyle='--')
-            ax_ll.set_title(f"Cross-Korelacja: {prod_lead} vs {prod_lag}")
-            ax_ll.set_xlabel("Przesunięcie w czasie (Lags)")
-            ax_ll.set_ylabel("Współczynnik Korelacji")
-            st.write("💡 *Najwyższy słupek po PRAWEJ stronie od zera oznacza, że Aktywo 1 skutecznie wyprzedza Aktywo 2.*")
-            st.pyplot(fig_ll)
+            # Zmiany po stronie Bid (Popyt)
+            cond_b1 = df_4['bid_price_1'] >= df_4['prev_bid']
+            cond_b2 = df_4['bid_price_1'] <= df_4['prev_bid']
+            delta_bid_vol = np.where(cond_b1, df_4['bid_volume_1'], 0) - np.where(cond_b2, df_4['prev_bid_vol'], 0)
+            
+            # Zmiany po stronie Ask (Podaż)
+            cond_a1 = df_4['ask_price_1'] <= df_4['prev_ask']
+            cond_a2 = df_4['ask_price_1'] >= df_4['prev_ask']
+            delta_ask_vol = np.where(cond_a1, df_4['ask_volume_1'], 0) - np.where(cond_a2, df_4['prev_ask_vol'], 0)
+            
+            df_4['OFI'] = delta_bid_vol - delta_ask_vol
+            df_4['OFI_CUM'] = df_4['OFI'].cumsum()
+            
+            fig4 = make_subplots(specs=[[{"secondary_y": True}]])
+            fig4.add_trace(go.Scatter(x=df_4['timestamp'], y=df_4['mid_price'], name="Mid Price", line=dict(color='white')), secondary_y=False)
+            fig4.add_trace(go.Scatter(x=df_4['timestamp'], y=df_4['OFI_CUM'], name="Skumulowane OFI", line=dict(color=COLOR_NEUT)), secondary_y=True)
+            
+            fig4.update_layout(height=500, template='plotly_dark', title="Skumulowany Order Flow Imbalance vs Cena")
+            st.plotly_chart(fig4, use_container_width=True)
+        else:
+            st.warning("Brak danych głębokości arkusza.")
 
     # ==========================================
-    # ZAKŁADKA 5: ORDER BOOK IMBALANCE (OBI)
+    # ZAKŁADKA 5: ML REŻIMY RYNKOWE I CECHY
     # ==========================================
     with tabs[4]:
-        st.header("Order Book Imbalance (OBI) i Predictive Power")
-        prod_obi = st.selectbox("Wybierz aktywo:", products, key='t5_prod')
-        df_obi = prices_df[prices_df['product'] == prod_obi].copy()
+        st.header("ML: Reżimy (K-Means) & Znaczenie Cech (Random Forest)")
+        prod_5 = st.selectbox("Aktywo:", products, key='t5_p')
+        df_5 = prices_df[prices_df['product'] == prod_5].copy()
         
-        if 'bid_volume_1' in df_obi.columns and 'ask_volume_1' in df_obi.columns:
-            df_obi['OBI'] = (df_obi['bid_volume_1'] - df_obi['ask_volume_1']) / (df_obi['bid_volume_1'] + df_obi['ask_volume_1'])
-            obi_ma_win = st.slider("Wygładzanie OBI", 1, 50, 10)
-            df_obi['OBI_MA'] = df_obi['OBI'].rolling(window=obi_ma_win).mean()
+        c5_1, c5_2 = st.columns(2)
+        
+        with c5_1:
+            st.subheader("K-Means: Stany Rynku")
+            df_5['Ret'] = df_5['mid_price'].pct_change()
+            df_5['Vol'] = df_5['Ret'].rolling(roll_win).std()
+            df_5['Spread'] = df_5['ask_price_1'] - df_5['bid_price_1'] if 'bid_price_1' in df_5.columns else 0
+            df_5_clean = df_5.dropna().copy()
             
-            fig_obi1, ax_o1 = plt.subplots(figsize=(16, 5))
-            ax_o2 = ax_o1.twinx()
-            ax_o1.plot(df_obi['timestamp'], df_obi['mid_price'], color='white', label='Mid Price')
-            ax_o2.plot(df_obi['timestamp'], df_obi['OBI_MA'], color='#ff00ff', label=f'OBI MA({obi_ma_win})', alpha=0.7)
-            ax_o2.axhline(0, color='gray', linestyle='--')
-            ax_o1.legend(loc='upper left'); ax_o2.legend(loc='upper right')
-            st.pyplot(fig_obi1)
-            
-            # Scatter Plot: OBI vs Future Returns
-            st.subheader("Czy wysokie OBI przewiduje wzrost ceny?")
-            fut_steps = st.slider("Horyzont predykcji (kroki w przód)", 1, 50, 10)
-            df_obi['Future_Return'] = df_obi['mid_price'].shift(-fut_steps) - df_obi['mid_price']
-            
-            fig_obi2, ax_o3 = plt.subplots(figsize=(8, 6))
-            sns.scatterplot(x='OBI', y='Future_Return', data=df_obi.dropna(), alpha=0.2, color=COLOR_NEUTRAL, ax=ax_o3)
-            ax_o3.axhline(0, color='red', linestyle='--'); ax_o3.axvline(0, color='red', linestyle='--')
-            ax_o3.set_title(f"OBI vs Zmiana ceny po {fut_steps} krokach")
-            # Linia regresji
-            idx = df_obi[['OBI', 'Future_Return']].dropna()
-            if not idx.empty:
-                m, b = np.polyfit(idx['OBI'], idx['Future_Return'], 1)
-                ax_o3.plot(idx['OBI'], m*idx['OBI'] + b, color='yellow', linewidth=2, label=f'Trend (Nachylenie: {m:.4f})')
-                ax_o3.legend()
-            st.pyplot(fig_obi2)
-        else:
-            st.warning("Brak danych o wolumenie L1 w pliku.")
+            if len(df_5_clean) > 50:
+                scaler = StandardScaler()
+                scaled = scaler.fit_transform(df_5_clean[['Vol', 'Spread']])
+                kmeans = KMeans(n_clusters=ml_clusters, random_state=42, n_init=10)
+                df_5_clean['Regime'] = kmeans.fit_predict(scaled).astype(str)
+                
+                fig5a = px.scatter(df_5_clean, x='timestamp', y='mid_price', color='Regime', template='plotly_dark')
+                st.plotly_chart(fig5a, use_container_width=True)
+        
+        with c5_2:
+            st.subheader("Random Forest: Predyktory")
+            if 'bid_volume_1' in df_5.columns:
+                df_5['OBI'] = (df_5['bid_volume_1'] - df_5['ask_volume_1']) / (df_5['bid_volume_1'] + df_5['ask_volume_1'] + 0.001)
+                df_5['Target'] = df_5['mid_price'].shift(-10) - df_5['mid_price']
+                ml_df = df_5[['Spread', 'OBI', 'Vol', 'Target']].dropna()
+                
+                rf = RandomForestRegressor(n_estimators=rf_trees, max_depth=5, random_state=42)
+                rf.fit(ml_df.drop('Target', axis=1), ml_df['Target'])
+                
+                imp = pd.DataFrame({'Cecha': ['Spread', 'OBI', 'Zmienność'], 'Ważność': rf.feature_importances_})
+                fig5b = px.bar(imp, x='Ważność', y='Cecha', orientation='h', template='plotly_dark', color='Ważność')
+                st.plotly_chart(fig5b, use_container_width=True)
+            else:
+                st.write("Brak wolumenu do wyliczenia cech.")
 
     # ==========================================
-    # ZAKŁADKA 6: TAPE READING (INSIDERS)
+    # ZAKŁADKA 6: GREKI OPCJI
     # ==========================================
     with tabs[5]:
-        st.header("Identyfikacja Poinformowanych Botów (Tape Reading)")
-        if trades_df is not None and 'buyer' in trades_df.columns:
-            unique_ids = trades_df['buyer'].dropna().unique()
-            if len(unique_ids) > 1 and unique_ids[0] != '?':
-                prod_tr = st.selectbox("Produkt do śledzenia:", products, key='t6_prod')
-                horiz = st.slider("Horyzont weryfikacji (Kroki)", 1, 50, 10)
-                
-                price_map = prices_df[prices_df['product'] == prod_tr].set_index('timestamp')['mid_price']
-                df_tr = trades_df[trades_df['product'] == prod_tr].copy()
-                df_tr['future_price'] = df_tr['timestamp'].map(lambda x: price_map.get(x + horiz * 100))
-                df_tr['profit'] = df_tr['future_price'] - df_tr['price'] # W muszelkach
-                
-                col_tr1, col_tr2 = st.columns(2)
-                with col_tr1:
-                    st.subheader("Najlepsi Kupujący (LONG)")
-                    st.write(f"Ile zarobili po {horiz} krokach?")
-                    b_perf = df_tr.groupby('buyer').agg({'profit':'mean', 'price':'count'}).rename(columns={'profit':'Avg Profit (Shells)', 'price':'Trades'})
-                    st.dataframe(b_perf.query('Trades > 5').sort_values(by='Avg Profit (Shells)', ascending=False).style.background_gradient(cmap='Greens'))
-                with col_tr2:
-                    st.subheader("Najlepsi Sprzedający (SHORT)")
-                    st.write(f"Ile oszczędzili (spadek ceny) po {horiz} krokach?")
-                    s_perf = df_tr.groupby('seller').agg({'profit':'mean', 'price':'count'}).rename(columns={'profit':'Avg Drop (Shells)', 'price':'Trades'})
-                    st.dataframe(s_perf.query('Trades > 5').sort_values(by='Avg Drop (Shells)', ascending=True).style.background_gradient(cmap='Reds_r'))
-            else:
-                st.info("Zarządzanie uczestnikami anonimowe w tej rundzie.")
-        else: st.warning("Wymagany plik Trades CSV z kolumnami buyer/seller.")
+        st.header("Model Blacka-Scholesa i Zarządzanie Ryzykiem (Greki)")
+        
+        c6_1, c6_2, c6_3 = st.columns(3)
+        c6_4, c6_5, c6_6 = st.columns(3)
+        S_opt = c6_1.number_input("Cena Instrumentu Bazowego (S)", value=10000.0)
+        K_opt = c6_2.number_input("Cena Wykonania (Strike - K)", value=10000.0)
+        T_opt = c6_3.number_input("Czas (T)", value=1.0)
+        r_opt = c6_4.number_input("Stopa wolna od ryzyka (r)", value=0.0)
+        iv_opt = c6_5.number_input("Zmienność IV (σ)", value=0.16)
+        o_type = c6_6.selectbox("Typ Opcji", ['call', 'put'])
+        
+        if T_opt > 0 and iv_opt > 0:
+            price, delta, gamma, theta, vega = bs_greeks(S_opt, K_opt, T_opt, r_opt, iv_opt, o_type)
+            
+            st.markdown(f"### Wycena Teoretyczna: **{price:.2f}**")
+            
+            g1, g2, g3, g4 = st.columns(4)
+            g1.metric("Δ Delta (Ekspozycja kierunkowa)", f"{delta:.4f}")
+            g2.metric("Γ Gamma (Zmiana Delty)", f"{gamma:.6f}")
+            g3.metric("Θ Theta (Utrata wartości w czasie)", f"{theta:.4f}")
+            g4.metric("ν Vega (Ekspozycja na zmienność)", f"{vega:.4f}")
+            
+            # Symulacja Delty
+            prices = np.linspace(S_opt*0.8, S_opt*1.2, 100)
+            deltas = [bs_greeks(p, K_opt, T_opt, r_opt, iv_opt, o_type)[1] for p in prices]
+            fig6 = px.line(x=prices, y=deltas, title="Krzywa Delty w zależności od ceny S", template='plotly_dark')
+            fig6.update_layout(xaxis_title="Cena S", yaxis_title="Delta")
+            st.plotly_chart(fig6, use_container_width=True)
 
     # ==========================================
-    # ZAKŁADKA 7: BOT FINGERPRINT (BLIND)
+    # ZAKŁADKA 7: VPIN I TAPE READING
     # ==========================================
     with tabs[6]:
-        st.header("Algorithmic Fingerprinting (Blind Detection)")
-        st.write("Wykrywanie mechanicznych zachowań w anonimowym Order Flow.")
+        st.header("Tape Reading i VPIN (Toksyczność Przepływu)")
         if trades_df is not None:
-            prod_fp = st.selectbox("Produkt:", products, key='t7_prod')
-            df_fp = trades_df[trades_df['product'] == prod_fp]
+            prod_7 = st.selectbox("Aktywo:", products, key='t7_p')
+            df_t7 = trades_df[trades_df['product'] == prod_7].copy()
+            df_p7 = prices_df[prices_df['product'] == prod_7].set_index('timestamp')['mid_price']
             
-            c_fp1, c_fp2 = st.columns(2)
-            with c_fp1:
-                st.subheader("Rozkład Rozmiarów Zleceń")
-                vols = df_fp['quantity'].value_counts().head(10).reset_index()
-                vols.columns = ['Rozmiar Zlecenia', 'Liczba Wystąpień']
-                st.dataframe(vols, hide_index=True)
-                
-            with c_fp2:
-                top_vol = st.selectbox("Wybierz stały wolumen do analizy częstości:", vols['Rozmiar Zlecenia'])
-                df_spec = df_fp[df_fp['quantity'] == top_vol].copy()
-                df_spec['time_diff'] = df_spec['timestamp'].diff()
-                fig_fp, ax_fp = plt.subplots(figsize=(6, 4))
-                sns.histplot(df_spec['time_diff'].dropna(), bins=30, color='orange', ax=ax_fp)
-                ax_fp.set_title(f"Rozkład odstępów czasu dla zleceń o rozmiarze {top_vol}")
-                st.pyplot(fig_fp)
-        else: st.warning("Wymagany plik Trades CSV.")
+            # VPIN
+            df_t7['dir'] = np.where(df_t7['price'].diff() > 0, 1, -1)
+            df_t7['b_vol'] = np.where(df_t7['dir'] == 1, df_t7['quantity'], 0)
+            df_t7['s_vol'] = np.where(df_t7['dir'] == -1, df_t7['quantity'], 0)
+            
+            rb = df_t7['b_vol'].rolling(roll_win).sum()
+            rs = df_t7['s_vol'].rolling(roll_win).sum()
+            df_t7['VPIN'] = abs(rb - rs) / (rb + rs + 0.001)
+            
+            fig7 = make_subplots(specs=[[{"secondary_y": True}]])
+            fig7.add_trace(go.Scatter(x=df_t7['timestamp'], y=df_t7['timestamp'].map(df_p7), name="Cena", line=dict(color='white')), secondary_y=False)
+            fig7.add_trace(go.Scatter(x=df_t7['timestamp'], y=df_t7['VPIN'], name="VPIN", line=dict(color='red')), secondary_y=True)
+            fig7.add_hline(y=0.7, line_dash="dash", line_color="orange", secondary_y=True)
+            fig7.update_layout(height=500, template='plotly_dark', title="Wskaźnik Toksyczności VPIN"); st.plotly_chart(fig7, use_container_width=True)
+            
+            # Tape Reading
+            if 'buyer' in df_t7.columns and df_t7['buyer'].dropna().nunique() > 1:
+                st.subheader("Aktywność Traderów")
+                b_agg = df_t7.groupby('buyer')['quantity'].sum().reset_index()
+                fig7b = px.bar(b_agg.head(15), x='buyer', y='quantity', title="Najwięksi Kupujący", template='plotly_dark', color='quantity')
+                st.plotly_chart(fig7b, use_container_width=True)
+        else:
+            st.warning("Wgraj trades.csv")
 
     # ==========================================
-    # ZAKŁADKA 8: SYGNAŁY ZEWNĘTRZNE
+    # ZAKŁADKA 8: BACKTESTER I KELLY CRITERION
     # ==========================================
     with tabs[7]:
-        st.header("Analiza Danych Egzogenicznych (Obserwacje)")
-        std_cols = ['day', 'timestamp', 'product', 'bid_price_1', 'bid_volume_1', 'bid_price_2', 'bid_volume_2', 'bid_price_3', 'bid_volume_3', 'ask_price_1', 'ask_volume_1', 'ask_price_2', 'ask_volume_2', 'ask_price_3', 'ask_volume_3', 'mid_price', 'profit_and_loss']
-        obs_cols = [c for c in prices_df.columns if c not in std_cols and pd.api.types.is_numeric_dtype(prices_df[c])]
+        st.header("Backtester Sygnałów MA & Kelly Criterion")
+        st.write("Testujemy, i na podstawie wyników obliczamy optymalne pozycjonowanie kapitału.")
         
-        if obs_cols:
-            prod_obs = st.selectbox("Produkt:", products, key='t8_prod')
-            sig_col = st.selectbox("Obserwacja (Sygnał):", obs_cols)
-            df_obs = prices_df[prices_df['product'] == prod_obs].copy()
+        c8_1, c8_2, c8_3 = st.columns(3)
+        prod_8 = c8_1.selectbox("Aktywo:", products, key='t8_p')
+        fast_ma = c8_2.number_input("Szybka MA", value=10)
+        slow_ma = c8_3.number_input("Wolna MA", value=50)
+        
+        df_8 = prices_df[prices_df['product'] == prod_8].copy()
+        df_8['MA_F'] = df_8['mid_price'].rolling(fast_ma).mean()
+        df_8['MA_S'] = df_8['mid_price'].rolling(slow_ma).mean()
+        
+        df_8['Signal'] = np.where(df_8['MA_F'] > df_8['MA_S'], 1, -1)
+        df_8['Position'] = df_8['Signal'].shift(1).fillna(0)
+        df_8['Trade_Return'] = df_8['Position'] * df_8['mid_price'].diff()
+        df_8['Cum_PnL'] = df_8['Trade_Return'].cumsum()
+        
+        fig8 = make_subplots(specs=[[{"secondary_y": True}]])
+        fig8.add_trace(go.Scatter(x=df_8['timestamp'], y=df_8['mid_price'], name="Cena", line=dict(color='gray')), secondary_y=False)
+        fig8.add_trace(go.Scatter(x=df_8['timestamp'], y=df_8['Cum_PnL'], name="PnL", line=dict(color=COLOR_UP, width=2)), secondary_y=True)
+        fig8.update_layout(height=500, template='plotly_dark'); st.plotly_chart(fig8, use_container_width=True)
+        
+        # Kelly Criterion
+        st.subheader("Zarządzanie Rozmiarem Pozycji (Kryterium Kelly'ego)")
+        winning_trades = df_8[df_8['Trade_Return'] > 0]['Trade_Return']
+        losing_trades = df_8[df_8['Trade_Return'] < 0]['Trade_Return']
+        
+        if len(winning_trades) > 0 and len(losing_trades) > 0:
+            W = len(winning_trades) / (len(winning_trades) + len(losing_trades))
+            R = winning_trades.mean() / abs(losing_trades.mean())
             
-            fig_obs, ax_obs1 = plt.subplots(figsize=(16, 5))
-            ax_obs2 = ax_obs1.twinx()
-            ax_obs1.plot(df_obs['timestamp'], df_obs['mid_price'], color='white', label='Cena')
-            ax_obs2.plot(df_obs['timestamp'], df_obs[sig_col], color='cyan', alpha=0.7, label=sig_col)
-            ax_obs1.set_ylabel("Cena"); ax_obs2.set_ylabel("Wartość Obserwacji")
-            ax_obs1.legend(loc='upper left'); ax_obs2.legend(loc='upper right')
-            st.pyplot(fig_obs)
+            kelly_pct = W - ((1 - W) / R)
             
-            diff_corr = df_obs['mid_price'].diff().corr(df_obs[sig_col].diff())
-            st.metric("Korelacja Pochodnych (Ruch vs Ruch)", f"{diff_corr:.4f}")
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Win Rate (W)", f"{W*100:.1f}%")
+            k2.metric("Risk/Reward Ratio (R)", f"{R:.2f}")
+            
+            if kelly_pct > 0:
+                k3.metric("Optymalny rozmiar pozycji (Kelly)", f"{kelly_pct*100:.1f}% kapitału")
+                st.success("Strategia posiada pozytywną wartość oczekiwaną matematycznie.")
+            else:
+                k3.metric("Optymalny rozmiar pozycji (Kelly)", "0.0% (Nie graj!)")
+                st.error("Strategia generuje długoterminową stratę. Kryterium Kelly'ego zaleca brak ekspozycji.")
         else:
-            st.info("Brak dodatkowych sygnałów w pliku (np. DOLPHIN_SIGHTINGS, SUNLIGHT).")
-
-    # ==========================================
-    # ZAKŁADKA 9: OPCJE (BLACK-SCHOLES)
-    # ==========================================
-    with tabs[8]:
-        st.header("Wycena Opcji / Voucherów (Black-Scholes)")
-        st.write("Wykorzystaj matematykę do znalezienia arbitrażu na derywatach.")
-        c_bs1, c_bs2, c_bs3 = st.columns(3)
-        c_bs4, c_bs5, c_bs6 = st.columns(3)
-        
-        S = c_bs1.number_input("Cena Bazowa (Underlying - S)", value=10000.0)
-        K = c_bs2.number_input("Cena Wykonania (Strike - K)", value=10000.0)
-        T = c_bs3.number_input("Czas (T - ułamek roku/okresu)", value=1.0)
-        r = c_bs4.number_input("Stopa wolna od ryzyka (r)", value=0.0)
-        sigma = c_bs5.number_input("Zmienność Implikowana (IV - σ)", value=0.16)
-        
-        if T > 0 and sigma > 0:
-            d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
-            d2 = d1 - sigma*np.sqrt(T)
-            call_val = S*stats.norm.cdf(d1) - K*np.exp(-r*T)*stats.norm.cdf(d2)
-            put_val = K*np.exp(-r*T)*stats.norm.cdf(-d2) - S*stats.norm.cdf(-d1)
-            
-            c_bs6.metric("Teoretyczne CALL", f"{call_val:.2f}")
-            c_bs6.metric("Teoretyczne PUT", f"{put_val:.2f}")
-            
-            # Generowanie uśmiechu zmienności (Volatility Smile)
-            st.subheader("Symulacja cen dla różnych wartości IV")
-            ivs = np.linspace(0.05, 0.50, 50)
-            calls = [S*stats.norm.cdf((np.log(S/K) + (r + 0.5*v**2)*T) / (v*np.sqrt(T))) - K*np.exp(-r*T)*stats.norm.cdf(((np.log(S/K) + (r + 0.5*v**2)*T) / (v*np.sqrt(T))) - v*np.sqrt(T)) for v in ivs]
-            
-            fig_bs, ax_bs = plt.subplots(figsize=(8, 4))
-            ax_bs.plot(ivs, calls, color='#00ffcc')
-            ax_bs.axvline(sigma, color='red', linestyle='--', label='Twoje IV')
-            ax_bs.set_xlabel("Implied Volatility (IV)"); ax_bs.set_ylabel("Cena Opcji Call")
-            ax_bs.grid(color='#333333', linestyle='--'); ax_bs.legend()
-            st.pyplot(fig_bs)
-
-    # ==========================================
-    # ZAKŁADKA 10: DEEP L2/L3 VWAP
-    # ==========================================
-    with tabs[9]:
-        st.header("Analiza Głębokości L2/L3 & True VWAP")
-        prod_l2 = st.selectbox("Produkt:", products, key='t10_prod')
-        df_l2 = prices_df[prices_df['product'] == prod_l2].copy()
-        
-        if 'bid_price_2' in df_l2.columns:
-            b_vol_tot = df_l2['bid_volume_1'].fillna(0) + df_l2['bid_volume_2'].fillna(0) + df_l2.get('bid_volume_3', pd.Series(0, index=df_l2.index)).fillna(0)
-            a_vol_tot = df_l2['ask_volume_1'].fillna(0) + df_l2['ask_volume_2'].fillna(0) + df_l2.get('ask_volume_3', pd.Series(0, index=df_l2.index)).fillna(0)
-            
-            b_vwap = (df_l2['bid_price_1']*df_l2['bid_volume_1'].fillna(0) + df_l2['bid_price_2']*df_l2['bid_volume_2'].fillna(0) + df_l2.get('bid_price_3', 0)*df_l2.get('bid_volume_3', 0).fillna(0)) / np.where(b_vol_tot==0, 1, b_vol_tot)
-            a_vwap = (df_l2['ask_price_1']*df_l2['ask_volume_1'].fillna(0) + df_l2['ask_price_2']*df_l2['ask_volume_2'].fillna(0) + df_l2.get('ask_price_3', 0)*df_l2.get('ask_volume_3', 0).fillna(0)) / np.where(a_vol_tot==0, 1, a_vol_tot)
-            
-            df_l2['True_VWAP'] = (b_vwap + a_vwap) / 2
-            
-            fig_l2, ax_l2 = plt.subplots(figsize=(16, 5))
-            ax_l2.plot(df_l2['timestamp'], df_l2['mid_price'], color='gray', label='Standard Mid Price', alpha=0.5)
-            ax_l2.plot(df_l2['timestamp'], df_l2['True_VWAP'], color='#ff00ff', label='L3 VWAP', linestyle='--')
-            ax_l2.set_title("Mid Price vs Rzeczywisty VWAP z uwzględnieniem głębokości")
-            ax_l2.legend(); ax_l2.grid(color='#333333', linestyle='--')
-            st.pyplot(fig_l2)
-        else: st.warning("Brak poziomów L2 w arkuszu.")
-
-    # ==========================================
-    # ZAKŁADKA 11: AUTOKORELACJA (ACF)
-    # ==========================================
-    with tabs[10]:
-        st.header("Badanie Cykliczności i Stacjonarności (ACF/PACF)")
-        prod_acf = st.selectbox("Aktywo:", products, key='t11_prod')
-        ts_data = prices_df[prices_df['product'] == prod_acf]['mid_price'].dropna()
-        lags = st.slider("Liczba opóźnień (Lags)", 10, 200, 40)
-        
-        adf_stat, p_val, _, _, _, _ = adfuller(ts_data)
-        st.metric("Test Dickeya-Fullera (Stacjonarność, p-value)", f"{p_val:.4f}")
-        if p_val < 0.05:
-            st.success("Szereg jest stacjonarny! Idealny kandydat do strategii powrotu do średniej (Mean-Reversion).")
-        else:
-            st.error("Szereg niestacjonarny (Trend Random Walk). Lepsze będą strategie podążania za trendem (Momentum).")
-            
-        fig_acf, (ax_a1, ax_a2) = plt.subplots(1, 2, figsize=(16, 5))
-        plot_acf(ts_data, lags=lags, ax=ax_a1, color=COLOR_NEUTRAL)
-        plot_pacf(ts_data, lags=lags, ax=ax_a2, color=COLOR_NEUTRAL)
-        st.pyplot(fig_acf)
-
-    # ==========================================
-    # ZAKŁADKA 12: BACKTESTER SANDBOX (NOWOŚĆ!)
-    # ==========================================
-    with tabs[11]:
-        st.header("💰 Strategiczny Sandbox (Symulacja PnL)")
-        st.write("Przetestuj prostą strategię w locie na wczytanych danych.")
-        
-        col_bt1, col_bt2, col_bt3 = st.columns(3)
-        bt_prod = col_bt1.selectbox("Wybierz Produkt do testów:", products, key='bt_prod')
-        bt_fast = col_bt2.number_input("Szybka EMA", value=10)
-        bt_slow = col_bt3.number_input("Wolna EMA", value=50)
-        
-        df_bt = prices_df[prices_df['product'] == bt_prod].copy()
-        df_bt['EMA_F'] = df_bt['mid_price'].ewm(span=bt_fast).mean()
-        df_bt['EMA_S'] = df_bt['mid_price'].ewm(span=bt_slow).mean()
-        
-        # Logika sygnału: 1 za LONG (Fast > Slow), -1 za SHORT (Fast < Slow)
-        df_bt['Signal'] = np.where(df_bt['EMA_F'] > df_bt['EMA_S'], 1, -1)
-        df_bt['Position'] = df_bt['Signal'].shift(1).fillna(0) # Przesunięcie o 1 krok (nie handlujemy przyszłością)
-        
-        # Liczenie PnL (zakładamy handel 1 sztuką po cenie mid)
-        df_bt['Market_Return'] = df_bt['mid_price'].diff()
-        df_bt['Strategy_Return'] = df_bt['Position'] * df_bt['Market_Return']
-        df_bt['Cumulative_PnL'] = df_bt['Strategy_Return'].cumsum()
-        
-        fig_bt, ax_bt1 = plt.subplots(figsize=(16, 6))
-        ax_bt2 = ax_bt1.twinx()
-        
-        ax_bt1.plot(df_bt['timestamp'], df_bt['mid_price'], color='white', alpha=0.4, label='Cena Aktywa')
-        ax_bt2.plot(df_bt['timestamp'], df_bt['Cumulative_PnL'], color=COLOR_UP, linewidth=2, label='Skumulowany Zysk (PnL)')
-        ax_bt2.axhline(0, color='red', linestyle='--')
-        
-        ax_bt1.set_ylabel("Cena")
-        ax_bt2.set_ylabel("Zysk / Strata (Muszelki)")
-        ax_bt1.legend(loc='upper left'); ax_bt2.legend(loc='upper right')
-        
-        st.pyplot(fig_bt)
-        st.metric("Całkowity Wynik Strategii (PnL na 1 jednostce obrotu)", f"{df_bt['Cumulative_PnL'].iloc[-1]:.2f} muszelek")
+            st.write("Za mało transakcji do wyliczenia Kryterium Kelly'ego.")
 
 else:
-    st.info("👋 System gotowy. Wgraj pliki CSV (Prices i opcjonalnie Trades) w lewym panelu, aby uruchomić silnik analityczny.")
+    st.info("Oczekuję na wgranie plików (prices.csv / trades.csv), Dowódco.")
